@@ -140,6 +140,7 @@
     </plurals>
 
     <string name="downloader_error">Error downloading story</string>
+	<string name="downloader_overlay_permission_required">Please enable "Display over other apps" for this app, then try downloading again</string>
 
     <!-- Community Menu Activity -->
     <string name="menu_community_random">Random</string>
