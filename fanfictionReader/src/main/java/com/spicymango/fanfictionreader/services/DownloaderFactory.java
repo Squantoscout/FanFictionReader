@@ -375,7 +375,7 @@ class DownloaderFactory {
 				// temporarily blocking/challenging this request (retryable), or there is a genuine
 				// parsing issue in the app.
 				if (mStory == null) {
-					if (document.body().text().contains("Story Not Found") || document.body().text().contains("FanFiction.Net Error Type 1")) {
+					if (document.body().text().contains("Story Not Found") || document.body().text().contains("FanFiction.Net Error Type 1") || document.body().text().contains("FanFiction.Net Message Type 1")) {
 						// If the story was deleted from the web site, pass the error to the previous layer
 						throw new StoryNotFoundException("Story " + mStoryId + " does not exist");
 					} else if (looksLikeBotCheck(document)) {
@@ -394,7 +394,7 @@ class DownloaderFactory {
 			String storyText = document.select("div#storytext").html();
 
 			if (storyText == null || storyText.length() == 0) {
-				if (document.body().text().contains("FanFiction.Net Error Type 1")) {
+				if (document.body().text().contains("FanFiction.Net Error Type 1") || document.body().text().contains("FanFiction.Net Message Type 1")) {
 					// If a server error occurs, ignore the story
 					throw new StoryNotFoundException("Story " + mStoryId + " does not exist");
 				} else if (looksLikeBotCheck(document)) {

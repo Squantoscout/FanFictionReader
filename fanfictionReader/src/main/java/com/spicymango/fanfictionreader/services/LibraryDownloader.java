@@ -499,6 +499,7 @@ public class LibraryDownloader extends IntentService {
 			if (integrityCheck){
 				// If an integrity check is requested, re-download all missing chapters
 				// Download each missing chapter, updating the notification as required
+				integrityLoop:
 				while (downloader.hasNextChapter()) {
 					showUpdateNotification(storyTitle, downloader.getCurrentChapter(), downloader.getTotalChapters(), downloadStartTime);
 
@@ -517,7 +518,25 @@ public class LibraryDownloader extends IntentService {
 							}
 
 							consecutiveConnectionErrors++;
-							if (consecutiveConnectionErrors > 3) throw e;
+							if (consecutiveConnectionErrors > 3) {
+								// Give up on remaining chapters, but keep whatever has already been
+								// downloaded so it isn't lost - fall through to saveStory() below
+								// instead of aborting the whole method.
+								hasConnectionError = true;
+								lastConnectionErrorDetail = e.getMessage();
+								break integrityLoop;
+							}
+						} catch (StoryNotFoundException | ParseException e) {
+							// A single chapter being unavailable (e.g. very recently published and
+							// not yet indexed by the site) should not discard chapters that were
+							// already successfully downloaded in this session. Stop here and save
+							// what has been retrieved so far instead of losing everything.
+							if (e instanceof ParseException) {
+								FirebaseCrashlytics.getInstance().recordException(e);
+								hasParsingError = true;
+								lastParsingErrorDetail = e.getMessage();
+							}
+							break integrityLoop;
 						}
 					}
 				}
@@ -529,6 +548,7 @@ public class LibraryDownloader extends IntentService {
 				}
 
 				// Download each chapter, updating the notification as required
+				updateLoop:
 				while (downloader.hasNextChapter()) {
 					showUpdateNotification(storyTitle, downloader.getCurrentChapter(), downloader.getTotalChapters(), downloadStartTime);
 
@@ -547,7 +567,25 @@ public class LibraryDownloader extends IntentService {
 							}
 
 							consecutiveConnectionErrors++;
-							if (consecutiveConnectionErrors > 3) throw e;
+							if (consecutiveConnectionErrors > 3) {
+								// Give up on remaining chapters, but keep whatever has already been
+								// downloaded so it isn't lost - fall through to saveStory() below
+								// instead of aborting the whole method.
+								hasConnectionError = true;
+								lastConnectionErrorDetail = e.getMessage();
+								break updateLoop;
+							}
+						} catch (StoryNotFoundException | ParseException e) {
+							// A single chapter being unavailable (e.g. very recently published and
+							// not yet indexed by the site) should not discard chapters that were
+							// already successfully downloaded in this session. Stop here and save
+							// what has been retrieved so far instead of losing everything.
+							if (e instanceof ParseException) {
+								FirebaseCrashlytics.getInstance().recordException(e);
+								hasParsingError = true;
+								lastParsingErrorDetail = e.getMessage();
+							}
+							break updateLoop;
 						}
 					}
 				}
