@@ -118,6 +118,12 @@ public class LibraryDownloader extends IntentService {
 	private int consecutiveConnectionErrors;
 
 	/**
+	 * Holds the detailed message from the most recent connection failure, so it can be shown to
+	 * the user in the error notification instead of a generic message.
+	 */
+	private String lastConnectionErrorDetail;
+
+	/**
 	 * Stores the time at which the update process began. This is used to calculate the time elapsed
 	 * displayed in the notification.
 	 */
@@ -573,6 +579,7 @@ public class LibraryDownloader extends IntentService {
 		} catch (IOException e) {
 			// If a connection error occurs, set the flag and cancel the download by returning.
 			hasConnectionError = true;
+			lastConnectionErrorDetail = e.getMessage();
 		} catch (StoryNotFoundException e) {
 			// If the story is not found, exit without setting any flags. By not setting an error flag,
 			// notifications are avoided for deleted stories during batch updates.
@@ -601,11 +608,11 @@ public class LibraryDownloader extends IntentService {
 			// At least one story was updated. Show the title of the updated stories.
 			showUpdateCompleteNotification(storiesUpdated);
 		} else if (hasConnectionError) {
-			showErrorNotification(R.string.error_connection);
+			showErrorNotification(R.string.error_connection, lastConnectionErrorDetail);
 		} else if (hasParsingError) {
-			showErrorNotification(R.string.error_parsing);
+			showErrorNotification(R.string.error_parsing, null);
 		} else if (hasIoError) {
-			showErrorNotification(R.string.error_sd);
+			showErrorNotification(R.string.error_sd, null);
 		} else {
 			// The story did not require any updates; no changes were made.
 			removeNotification(NOTIFICATION_UPDATE_ID);
@@ -728,12 +735,19 @@ public class LibraryDownloader extends IntentService {
 	 * Show a notification that displays an error
 	 *
 	 * @param errorString The error string id
+	 * @param detail      Optional additional diagnostic detail to append to the notification, or
+	 *                    null if none is available.
 	 */
-	private void showErrorNotification(@StringRes int errorString) {
+	private void showErrorNotification(@StringRes int errorString, String detail) {
 		// Create the notification
+		final String text = detail == null || detail.isEmpty()
+				? getString(errorString)
+				: getString(errorString) + " (" + detail + ")";
+
 		NotificationCompat.Builder builder = new NotificationCompat.Builder(LibraryDownloader.this, NOTIFICATION_CHANNEL);
 		builder.setContentTitle(getString(R.string.downloader_error));
-		builder.setContentText(getString(errorString));
+		builder.setContentText(text);
+		builder.setStyle(new NotificationCompat.BigTextStyle().bigText(text));
 		builder.setSmallIcon(R.drawable.ic_not_close);
 		builder.setAutoCancel(true);
 

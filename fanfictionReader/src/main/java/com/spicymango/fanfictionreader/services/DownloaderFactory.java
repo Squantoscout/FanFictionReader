@@ -277,4 +277,351 @@ class DownloaderFactory {
 			} else{
 				// Determine the last time the story was updated
 				final int index = c.getColumnIndex(SqlConstants.KEY_UPDATED);
-				prevUpdate =
+				prevUpdate = c.getLong(index);
+				c.close();
+			}
+
+			return mStory.getUpdated().getTime() > prevUpdate;
+		}
+
+		@Override
+		public boolean hasNextChapter() {
+			return mCurrentPage <= getTotalChapters();
+		}
+
+		@Override
+		public Story getStoryState() throws IOException, ParseException, StoryNotFoundException {
+			// The downloadChapter() code automatically fills mStory. Since every single story
+			// is warrantied to have a chapter 1, attempt to download the chapter.
+			if (mStory == null) {
+				mCurrentPage = 1;
+				downloadChapter();
+			}
+			return mStory;
+		}
+
+		@Override
+		public int getTotalChapters() {
+			// Verify the class state
+			if (mStory == null)
+				throw new IllegalStateException("The mStory state must be loaded before calling getStoryTitle");
+			return mStory.getChapterLength();
+		}
+
+		@Override
+		public int getCurrentChapter() {
+			return mCurrentPage;
+		}
+
+		@Override
+		public void downloadChapter() throws IOException, ParseException, StoryNotFoundException {
+			final String url = "https://www.fanfiction.net/s/" + mStoryId + "/"
+					+ mCurrentPage + "/";
+
+			// Try to load the document. This must be done from the main thread
+			final Handler mainHandler = new Handler(mContext.getMainLooper());
+			final Runnable runnable = () -> mWebView.loadUrl(url);
+			mHtmlFromWebView = null;
+
+			// Wait for the WebView to finish loading
+			synchronized (mutex){
+				mainHandler.post(runnable);
+				try {
+					while (mHtmlFromWebView == null){
+						mutex.wait();
+					}
+				} catch (InterruptedException e){
+					throw new IOException();
+				}
+			}
+
+			if (mHtmlFromWebView.equalsIgnoreCase("404")){
+				throw new IOException(mLastErrorDetail);
+			}
+
+			final Document document = Jsoup.parse(mHtmlFromWebView, url);
+
+			// On the first run, update the mStory variable
+			if (mCurrentPage == 1) {
+				mStory = parseDetails(document);
+
+				// If an error occurs while parsing, quit
+				// Note that there are two possibilities: either the error is in the server (which should fail silently)
+				// or there is an issue in the app
+				if (mStory == null) {
+					if (document.body().text().contains("Story Not Found") || document.body().text().contains("FanFiction.Net Error Type 1")) {
+						// If the story was deleted from the web site, pass the error to the previous layer
+						throw new StoryNotFoundException("Story " + mStoryId + " does not exist");
+					} else {
+						throw new ParseException("Error parsing story attributes for id: " + mStoryId, 0);
+					}
+				}
+			}
+
+			// Load the chapter itself
+			String storyText = document.select("div#storytext").html();
+
+			if (storyText == null || storyText.length() == 0) {
+				if (document.body().text().contains("FanFiction.Net Error Type 1")) {
+					// If a server error occurs, ignore the story
+					throw new StoryNotFoundException("Story " + mStoryId + " does not exist");
+				} else {
+					throw new ParseException("Error reading story text for id: "
+													 + mStoryId + " and chapter " + mCurrentPage, 0);
+				}
+			}
+
+			// Save the chapter on the sparse array
+			mText.put(mCurrentPage, storyText);
+
+			// If a download is successful, increment the current page counter. This only needs to
+			// be done when the first chapter is downloaded.
+			mCurrentPage++;
+		}
+
+		@Override
+		public void saveStory(int lastPageRead, int scrollOffset, boolean saveChapters) throws IOException{
+			// Write each of the chapters downloaded into the file system
+			if (saveChapters){
+				for (int i = 0; i < mText.size(); i++) {
+					final int key = mText.keyAt(i);
+					FileHandler.writeFile(mContext, mStoryId, key, mText.get(key));
+				}
+			}
+
+			// By default, the Story object has a date added equal to 0 upon creation. If this value
+			// is found, then the story is newly added and the date added should be set to the current
+			// date. Otherwise, the date added should be conserved.
+			final Date dateDownloaded, dateLastRead;
+			final ContentResolver resolver = mContext.getContentResolver();
+			final Cursor c = resolver.query(StoryProvider.FF_CONTENT_URI,
+											new String[] { SqlConstants.KEY_ADDED, SqlConstants.KEY_LAST_READ },
+											SqlConstants.KEY_STORY_ID + " = ?",
+											new String[] { String.valueOf(mStoryId) }, null);
+
+			if (c == null){
+				// Validate the cursor
+				dateDownloaded = null;
+				dateLastRead = null;
+			} else if (!c.moveToFirst()) {
+				// Check that the cursor is not empty
+				c.close();
+				dateDownloaded = null;
+				dateLastRead = null;
+			} else{
+				// Determine the last time the story was updated
+				dateDownloaded = new Date(c.getLong(c.getColumnIndex(SqlConstants.KEY_ADDED)));
+				dateLastRead = new Date(c.getLong(c.getColumnIndex(SqlConstants.KEY_LAST_READ)));
+				c.close();
+			}
+			final Date dateAdded = (dateDownloaded != null ? dateDownloaded : new Date()),
+					dateRead = (dateLastRead != null ? dateLastRead : new Date(0));
+
+			// Update the content provider
+			resolver.insert(StoryProvider.FF_CONTENT_URI, mStory.toContentValues(lastPageRead, scrollOffset, dateAdded, dateRead));
+		}
+
+		@Override
+		public void EnableIncrementalUpdating() {
+			//If there are more chapters, assume that the preceding chapters have not been revised
+			// and skip them while updating
+			int chaptersOnLastUpdate = StoryProvider.numberOfChapters(mContext, Site.FANFICTION, mStoryId);
+			if (chaptersOnLastUpdate > 1 && getTotalChapters() > chaptersOnLastUpdate) {
+				// The first chapter that should be downloaded is the one following the last
+				// one from the previous update.
+				mCurrentPage = chaptersOnLastUpdate + 1;
+			}
+			// Note that if a revision was performed, the total number of chapters before
+			// and after the update will match; therefore, no chapters will be skipped
+			// while updating.
+		}
+
+		@Override
+		public void downloadIfMissing() throws IOException, ParseException, StoryNotFoundException {
+			// First, check if the chapter is missing.
+			if (FileHandler.getFile(mContext, mStoryId, mCurrentPage) == null) {
+				// If it is missing, download the missing chapter.
+				downloadChapter();
+			} else {
+				mCurrentPage++;
+			}
+		}
+
+		/**
+		 * Obtains the story object from the one available online
+		 *
+		 * @param document The web page
+		 * @return The story object, or null if a parsing error occurs
+		 */
+		private Story parseDetails(Document document) {
+
+			Elements categoryElements = document.select("div#pre_story_links span a");
+			if (categoryElements.isEmpty()) return null;
+			String category = categoryElements.last().ownText();
+
+			Element titleElement = document.select("div#profile_top > b").first();
+			if (titleElement == null) return null;
+			String title = titleElement.ownText();
+
+			Element authorElement = document.select("div#profile_top > a").first();
+			if (authorElement == null) return null;
+			String author = authorElement.ownText();
+
+			Matcher matcher = PATTERN_FF.matcher(authorElement.attr("href"));
+			if (!matcher.find()) return null;
+			int authorId = Integer.parseInt(matcher.group(1));
+
+			Element summaryElement = document.select("div#profile_top > div").first();
+			if (summaryElement == null) return null;
+			String summary = summaryElement.ownText();
+
+			Element attributes = document.select("div#profile_top > span").last();
+
+			Elements dates = attributes.select("span[data-xutime]");
+			if (dates.isEmpty()) return null;
+			long updateDate = Long.parseLong(dates.first().attr("data-xutime")) * 1000;
+			long publishDate = Long.parseLong(dates.last().attr("data-xutime")) * 1000;
+
+
+			matcher = PATTERN_ATTRIB.matcher(attributes.text());
+			if (!matcher.find()) return null;
+
+			Story.Builder builder = new Story.Builder();
+			builder.setId(mStoryId);
+			builder.setName(title);
+			builder.setAuthor(author);
+			builder.setAuthorId(authorId);
+			builder.setSummary(summary);
+			builder.setCategory(category);
+			builder.setRating(matcher.group(1));
+			builder.setLanguage(matcher.group(2));
+			if (matcher.group(3) != null) builder.setGenre(matcher.group(3));
+			if (matcher.group(4) != null) {
+				String[] characterArray = matcher.group(4).split("([,\\[\\]] ?)++");
+				for (String character : characterArray) {
+					if (!TextUtils.isEmpty(character))
+						builder.addCharacter(character);
+				}
+			}
+			if (matcher.group(5) != null)
+				builder.setChapterLength(Parser.parseInt(matcher.group(5)));
+			builder.setWordLength(Parser.parseInt(matcher.group(6)));
+			if (matcher.group(7) != null) builder.setReviews(Parser.parseInt(matcher.group(7)));
+			if (matcher.group(8) != null) builder.setFavorites(Parser.parseInt(matcher.group(8)));
+			if (matcher.group(9) != null) builder.setFollows(Parser.parseInt(matcher.group(9)));
+			builder.setUpdateDate(updateDate);
+			builder.setPublishDate(publishDate);
+			builder.setCompleted(attributes.text().contains("Complete"));
+
+			return builder.build();
+		}
+
+
+		private class JavascriptListener{
+			@android.webkit.JavascriptInterface
+			public void processHTML(String html) {
+				mHtmlFromWebView = html;
+				synchronized (mutex) {
+					mutex.notify();
+				}
+			}
+		}
+
+		/**
+		 * Holds a human-readable description of the most recent network failure, so that it can be
+		 * surfaced to the user in the error notification instead of a generic message.
+		 */
+		private String mLastErrorDetail = "Unknown error";
+
+		private class CustomWebView extends WebViewClient {
+			private final Object internalMutex = new Object();
+			private boolean mHasLoaded;
+
+			@Override
+			public void onReceivedError(WebView view, WebResourceRequest request,
+										WebResourceError error) {
+				super.onReceivedError(view, request, error);
+
+				// Only treat this as a fatal error if it affects the main page being loaded, not a
+				// sub-resource (ad, tracker, font, etc.) embedded within it.
+				if (request.isForMainFrame() && !request.getUrl().toString().contains("pagead")) {
+					mLastErrorDetail = "Network error " + error.getErrorCode() + ": " + error.getDescription();
+					mHtmlFromWebView = "404";
+					synchronized (mutex) {
+						mutex.notify();
+					}
+				}
+			}
+
+			@Override
+			public void onReceivedHttpError(WebView view, WebResourceRequest request,
+											WebResourceResponse errorResponse) {
+				super.onReceivedHttpError(view, request, errorResponse);
+
+				// Only treat this as a fatal error if it affects the main page being loaded, not a
+				// sub-resource (ad, tracker, font, etc.) embedded within it. Failing to check this
+				// means a single blocked ad or tracking script would be wrongly reported as the
+				// entire download failing.
+				if (!request.isForMainFrame()) return;
+
+				// If an HttpError is received, it may be a "Wait a few seconds" Cloudflare page.
+				// Use the internalMutex to wait 5 seconds before assuming an error.
+				mHasLoaded = false;
+				final int statusCode = errorResponse.getStatusCode();
+				final String reasonPhrase = errorResponse.getReasonPhrase();
+				new Thread(()->{
+					synchronized (internalMutex){
+						try {
+							internalMutex.wait(5*1000);
+						} catch (InterruptedException ignored) {}
+					}
+
+					if (!mHasLoaded){
+
+						// Even after waiting, the error persists. Return a connection error.
+						mLastErrorDetail = "HTTP error " + statusCode + ": " + reasonPhrase;
+						mHtmlFromWebView = "404";
+						synchronized (mutex) {
+							mutex.notify();
+						}
+					}
+				}).start();
+			}
+
+			@Override
+			public void onPageFinished(WebView view, String url) {
+				// Notify mutex that the Cloudflare "Wait a few seconds" page has loaded.
+				mHasLoaded = true;
+				synchronized (internalMutex){
+					internalMutex.notify();
+				}
+
+				// Pass the cookies from the webView to the cookie storage
+				final CookieManager manager = CookieManager.getInstance();
+				final String httpCookieHeader = manager.getCookie(url);
+
+				if (httpCookieHeader != null){
+					try {
+						final URI uri = new URI("https://fanfiction.net/");
+						final CookieStore cookieStore = ((java.net.CookieManager) CookieHandler.getDefault()).getCookieStore();
+
+						for (String cookieString : httpCookieHeader.split(";")){
+							final String[] splitCookie = cookieString.split("=");
+							HttpCookie cookie = new HttpCookie(splitCookie[0], splitCookie[1]);
+							cookieStore.add(uri, cookie);
+						}
+
+					} catch (URISyntaxException e) {
+						Log.d(getClass().getSimpleName(), "Failed to parse URI =" + url, e);
+					}
+				}
+
+				// Retrieve the html code.
+				view.loadUrl("javascript:window.HTMLOUT.processHTML('<html>'+document.getElementsByTagName('html')[0].innerHTML+'</html>');");
+
+				super.onPageFinished(view, url);
+			}
+		}
+
+	}
+}
