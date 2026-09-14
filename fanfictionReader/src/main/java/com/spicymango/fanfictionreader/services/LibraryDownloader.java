@@ -124,6 +124,12 @@ public class LibraryDownloader extends IntentService {
 	private String lastConnectionErrorDetail;
 
 	/**
+	 * Holds the detailed message from the most recent parsing failure, so it can be shown to the
+	 * user in the error notification instead of a generic message.
+	 */
+	private String lastParsingErrorDetail;
+
+	/**
 	 * Stores the time at which the update process began. This is used to calculate the time elapsed
 	 * displayed in the notification.
 	 */
@@ -587,6 +593,7 @@ public class LibraryDownloader extends IntentService {
 			// Parsing errors should be logged on Crashlytics for further analysis.
 			FirebaseCrashlytics.getInstance().recordException(e);
 			hasParsingError = true;
+			lastParsingErrorDetail = e.getMessage();
 		} finally{
 			// Remove the notification after the download stage is completed
 			removeNotification(NOTIFICATION_DOWNLOAD_ID);
@@ -610,7 +617,7 @@ public class LibraryDownloader extends IntentService {
 		} else if (hasConnectionError) {
 			showErrorNotification(R.string.error_connection, lastConnectionErrorDetail);
 		} else if (hasParsingError) {
-			showErrorNotification(R.string.error_parsing, null);
+			showErrorNotification(R.string.error_parsing, lastParsingErrorDetail);
 		} else if (hasIoError) {
 			showErrorNotification(R.string.error_sd, null);
 		} else {

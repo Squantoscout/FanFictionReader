@@ -38,6 +38,7 @@ import java.net.URI;
 import java.net.URISyntaxException;
 import java.text.ParseException;
 import java.util.Date;
+import java.util.Locale;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -212,6 +213,18 @@ class DownloaderFactory {
 		private final Object mutex;
 		private String mHtmlFromWebView;
 
+		/**
+		 * The time, in milliseconds since epoch, at which the last request was sent. Used to
+		 * throttle requests so that the app does not hammer FanFiction.net with back-to-back
+		 * requests, which can trigger the site's bot-detection after a burst of chapters.
+		 */
+		private long mLastRequestTime = 0;
+
+		/**
+		 * The minimum time to wait between consecutive chapter requests.
+		 */
+		private static final long MIN_REQUEST_INTERVAL_MS = 3000;
+
 
 		@SuppressLint("AddJavascriptInterface")
 		private FanFictionDownloader(Uri uri, Context context, WebView webView) {
@@ -315,6 +328,18 @@ class DownloaderFactory {
 
 		@Override
 		public void downloadChapter() throws IOException, ParseException, StoryNotFoundException {
+			// Throttle requests so consecutive chapter downloads don't fire back-to-back, which can
+			// trigger FanFiction.net's bot-detection after a burst of rapid requests.
+			final long elapsedSinceLastRequest = System.currentTimeMillis() - mLastRequestTime;
+			if (mLastRequestTime != 0 && elapsedSinceLastRequest < MIN_REQUEST_INTERVAL_MS) {
+				try {
+					Thread.sleep(MIN_REQUEST_INTERVAL_MS - elapsedSinceLastRequest);
+				} catch (InterruptedException e) {
+					Thread.currentThread().interrupt();
+				}
+			}
+			mLastRequestTime = System.currentTimeMillis();
+
 			final String url = "https://www.fanfiction.net/s/" + mStoryId + "/"
 					+ mCurrentPage + "/";
 
@@ -346,14 +371,21 @@ class DownloaderFactory {
 				mStory = parseDetails(document);
 
 				// If an error occurs while parsing, quit
-				// Note that there are two possibilities: either the error is in the server (which should fail silently)
-				// or there is an issue in the app
+				// Note that there are three possibilities: the story was deleted, the site is
+				// temporarily blocking/challenging this request (retryable), or there is a genuine
+				// parsing issue in the app.
 				if (mStory == null) {
 					if (document.body().text().contains("Story Not Found") || document.body().text().contains("FanFiction.Net Error Type 1")) {
 						// If the story was deleted from the web site, pass the error to the previous layer
 						throw new StoryNotFoundException("Story " + mStoryId + " does not exist");
+					} else if (looksLikeBotCheck(document)) {
+						// The site appears to be showing a bot-check/rate-limit page rather than the
+						// real content. Treat this as a retryable connection error rather than a fatal
+						// parsing error.
+						throw new IOException("Blocked or rate-limited by site: " + bodySnippet(document));
 					} else {
-						throw new ParseException("Error parsing story attributes for id: " + mStoryId, 0);
+						throw new ParseException("Error parsing story attributes for id: " + mStoryId
+														 + " - page content: " + bodySnippet(document), 0);
 					}
 				}
 			}
@@ -365,9 +397,15 @@ class DownloaderFactory {
 				if (document.body().text().contains("FanFiction.Net Error Type 1")) {
 					// If a server error occurs, ignore the story
 					throw new StoryNotFoundException("Story " + mStoryId + " does not exist");
+				} else if (looksLikeBotCheck(document)) {
+					// The site appears to be showing a bot-check/rate-limit page rather than the real
+					// chapter content. Treat this as a retryable connection error rather than a fatal
+					// parsing error.
+					throw new IOException("Blocked or rate-limited by site: " + bodySnippet(document));
 				} else {
 					throw new ParseException("Error reading story text for id: "
-													 + mStoryId + " and chapter " + mCurrentPage, 0);
+													 + mStoryId + " and chapter " + mCurrentPage
+													 + " - page content: " + bodySnippet(document), 0);
 				}
 			}
 
@@ -445,6 +483,41 @@ class DownloaderFactory {
 			} else {
 				mCurrentPage++;
 			}
+		}
+
+		/**
+		 * Checks whether a page appears to be a bot-check, rate-limit, or "please wait" interstitial
+		 * page rather than genuine FanFiction.net content. Such pages should be treated as a
+		 * retryable connection error rather than a fatal parsing error, since they typically resolve
+		 * on their own after a short wait.
+		 *
+		 * @param document The parsed page
+		 * @return True if the page looks like a bot-check/block page
+		 */
+		private boolean looksLikeBotCheck(Document document) {
+			if (document.body() == null) return false;
+			final String text = document.body().text().toLowerCase(Locale.US);
+			return text.contains("just a moment")
+					|| text.contains("checking your browser")
+					|| text.contains("attention required")
+					|| text.contains("verify you are human")
+					|| text.contains("enable javascript and cookies")
+					|| text.contains("unusual traffic")
+					|| text.contains("too many requests")
+					|| !document.select("#cf-challenge-running, .cf-browser-verification, #challenge-form, #challenge-stage").isEmpty();
+		}
+
+		/**
+		 * Extracts a short snippet of a page's body text, for use in diagnostic error messages so
+		 * that unexpected page content can be surfaced without dumping the entire page.
+		 *
+		 * @param document The parsed page
+		 * @return A short snippet of the page's text content
+		 */
+		private String bodySnippet(Document document) {
+			if (document.body() == null) return "(no body)";
+			final String text = document.body().text();
+			return text.length() > 150 ? text.substring(0, 150) + "..." : text;
 		}
 
 		/**
