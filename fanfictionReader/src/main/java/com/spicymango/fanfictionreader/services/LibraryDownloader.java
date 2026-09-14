@@ -7,14 +7,18 @@ import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.content.Context;
 import android.content.Intent;
+import android.graphics.PixelFormat;
 import android.net.Uri;
 import android.os.Build;
 import android.text.TextUtils;
 import android.text.format.DateUtils;
 import android.util.Log;
+import android.view.Gravity;
+import android.view.WindowManager;
 import android.webkit.CookieManager;
 import android.webkit.CookieSyncManager;
 import android.webkit.WebView;
+import android.widget.Toast;
 
 import com.google.firebase.crashlytics.FirebaseCrashlytics;
 import com.spicymango.fanfictionreader.R;
@@ -130,6 +134,12 @@ public class LibraryDownloader extends IntentService {
 
 	private WebView mWebView;
 
+	/**
+	 * True if {@link #mWebView} was successfully attached to a system overlay window. Used by
+	 * {@link #onDestroy()} to know whether the view needs to be detached.
+	 */
+	private boolean mWebViewAttachedToWindow;
+
 	public LibraryDownloader() {
 		super(LibraryDownloader.class.getName());
 	}
@@ -145,6 +155,8 @@ public class LibraryDownloader extends IntentService {
 	 * @param offset      The reader's current scroll offset
 	 */
 	public static void download(Context context, Uri uri, int currentPage, int offset) {
+		if (!ensureOverlayPermission(context)) return;
+
 		Intent i = new Intent(context, LibraryDownloader.class);
 		i.setData(uri);
 		i.putExtra(EXTRA_LAST_PAGE, currentPage);
@@ -157,6 +169,42 @@ public class LibraryDownloader extends IntentService {
 	}
 
 	/**
+	 * Checks whether the app has permission to draw overlay windows. This permission is required
+	 * because the downloader must attach its background {@link WebView} to a real window in order
+	 * for FanFiction.net's bot-detection JavaScript challenge to run correctly; a WebView that is
+	 * never attached to any window has its JavaScript timers throttled by Android, which prevents
+	 * the challenge from ever completing.
+	 * <p>
+	 * If the permission has not been granted, the user is redirected to the system settings screen
+	 * where it can be enabled, and the download is not started.
+	 *
+	 * @param context The calling context. If it is not an overlay-permission-eligible context the
+	 *                 permission prompt is still shown, since {@code ACTION_MANAGE_OVERLAY_PERMISSION}
+	 *                 works from any context via {@code FLAG_ACTIVITY_NEW_TASK}.
+	 * @return True if the permission is already granted (or not required on this API level), false
+	 * otherwise.
+	 */
+	private static boolean ensureOverlayPermission(Context context) {
+		if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) {
+			// The permission is granted automatically at install time on pre-Marshmallow devices.
+			return true;
+		}
+
+		if (android.provider.Settings.canDrawOverlays(context)) {
+			return true;
+		}
+
+		Toast.makeText(context, R.string.downloader_overlay_permission_required, Toast.LENGTH_LONG).show();
+
+		final Intent intent = new Intent(android.provider.Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+				Uri.parse("package:" + context.getPackageName()));
+		intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+		context.startActivity(intent);
+
+		return false;
+	}
+
+	/**
 	 * Scans a story for missing chapters and downloads them as required.
 	 *
 	 * @param context     The current context
@@ -165,6 +213,8 @@ public class LibraryDownloader extends IntentService {
 	 * @param offset      The reader's current scroll offset
 	 */
 	public static void integrityCheck(Context context, Uri uri, int currentPage, int offset) {
+		if (!ensureOverlayPermission(context)) return;
+
 		Intent i = new Intent(context, LibraryDownloader.class);
 		i.setData(uri);
 		i.putExtra(EXTRA_LAST_PAGE, currentPage);
@@ -197,6 +247,11 @@ public class LibraryDownloader extends IntentService {
 		mWebView.getSettings().setUserAgentString("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/87.0.4280.88 Safari/537.36");
 		mWebView.getSettings().setJavaScriptEnabled(true);
 		mWebView.getSettings().setDomStorageEnabled(true);
+
+		// Attach the WebView to an invisible system overlay window. This is required because a
+		// WebView that is never attached to any window has its JavaScript execution throttled by
+		// Android, which prevents FanFiction.net's bot-detection challenge page from ever finishing.
+		attachWebViewToWindow();
 
 
 		// Create the Notification Channel
@@ -255,6 +310,54 @@ public class LibraryDownloader extends IntentService {
 		}
 	}
 
+	/**
+	 * Attaches {@link #mWebView} to an invisible 1x1 system overlay window.
+	 * <p>
+	 * A {@link WebView} that is never attached to any window is throttled by Android: its
+	 * JavaScript timers are paused or slowed down, which breaks any site (such as FanFiction.net's
+	 * current bot-detection page) that relies on a timed script to finish loading. Attaching the
+	 * WebView to a real overlay window, even an invisible one, avoids this throttling.
+	 * <p>
+	 * This requires the {@code SYSTEM_ALERT_WINDOW} ("draw over other apps") permission. If the
+	 * permission is missing, the WebView is left unattached and downloads will likely continue to
+	 * fail with a connection error, since {@link #ensureOverlayPermission(Context)} is expected to
+	 * have already redirected the user to grant it before the service was started.
+	 */
+	private void attachWebViewToWindow() {
+		if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M
+				&& !android.provider.Settings.canDrawOverlays(this)) {
+			Log.w("LibraryDownloader", "Overlay permission not granted; WebView will be unattached");
+			return;
+		}
+
+		try {
+			final WindowManager windowManager = (WindowManager) getSystemService(Context.WINDOW_SERVICE);
+			if (windowManager == null) return;
+
+			final int overlayType = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
+					? WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+					: WindowManager.LayoutParams.TYPE_SYSTEM_ALERT;
+
+			final WindowManager.LayoutParams params = new WindowManager.LayoutParams(
+					1,
+					1,
+					overlayType,
+					WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+							| WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+							| WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+					PixelFormat.TRANSLUCENT);
+			params.gravity = Gravity.TOP | Gravity.START;
+
+			windowManager.addView(mWebView, params);
+			mWebViewAttachedToWindow = true;
+		} catch (Exception e) {
+			// If attaching fails for any reason (e.g. OEM restrictions), fall back to the
+			// unattached WebView rather than crashing the service.
+			Log.e("LibraryDownloader", "Failed to attach WebView to overlay window", e);
+			mWebViewAttachedToWindow = false;
+		}
+	}
+
 	@Override
 	public int onStartCommand(Intent intent, int flags, int startId) {
 		// Add the story to the queue of stories that need to be checked for updates and increments
@@ -272,6 +375,20 @@ public class LibraryDownloader extends IntentService {
 			removeNotification(NOTIFICATION_UPDATE_ID);
 			removeNotification(NOTIFICATION_DOWNLOAD_ID);
 		}
+
+		// Detach the WebView from the overlay window, if it was attached.
+		if (mWebViewAttachedToWindow) {
+			try {
+				final WindowManager windowManager = (WindowManager) getSystemService(Context.WINDOW_SERVICE);
+				if (windowManager != null) {
+					windowManager.removeView(mWebView);
+				}
+			} catch (Exception e) {
+				Log.e("LibraryDownloader", "Failed to detach WebView from overlay window", e);
+			}
+			mWebViewAttachedToWindow = false;
+		}
+
 		Log.d("LibraryDownloader", "Destroyed");
 
 		super.onDestroy();
@@ -665,4 +782,4 @@ public class LibraryDownloader extends IntentService {
 		assert manager != null;
 		manager.notify(NOTIFICATION_UPDATE_ID, notBuilder.build());
 	}
-}
+	}
